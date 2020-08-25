@@ -2,7 +2,11 @@ package main
 
 import (
 	"bufio"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +14,8 @@ import (
 	"net/http"
 )
 
+var pair = Must2(tls.LoadX509KeyPair("rootCa.cert", "rootCa.key")).(tls.Certificate)
+var rootTemplate,err = x509.ParseCertificate(pair.Certificate[0])
 func Must2(any interface{}, err error) interface{} {
 	Must(err)
 	return any
@@ -47,7 +53,7 @@ func (f Decoder) handleHTTPConnect(w http.ResponseWriter, r *http.Request) {
 		log(err)
 		return
 	}
-	NewAdaptor(&srcConn, w, r)
+	NewAdaptor(srcConn, w, r).decryptTLS()
 }
 
 func transfer(dst net.Conn, src net.Conn) {
@@ -60,41 +66,36 @@ func log(err error) {
 	fmt.Errorf("%v\n", err)
 }
 
-type TlsAdaptor struct {
-	srcRequestURI string
-	dstPort       int
-	dstHost       string
-	isHttp        bool
-	srcConn       *tls.Conn
-	client        *http.Client
-	reader        *ConnReader
+type TLSAdaptor struct {
+	srcRequestURI    string
+	selfSignCertPair tls.Certificate
+	isHttp           bool
+	srcConn          *tls.Conn
+	template         tls.Certificate
+	reader           *ConnReader
 }
 
-func NewAdaptor(conn *net.Conn, w http.ResponseWriter, r *http.Request) *TlsAdaptor {
-	pair := Must2(tls.LoadX509KeyPair("rootCa.cert", "rootCa.key")).(tls.Certificate)
-	tlsConn := tls.Server(*conn, &tls.Config{
-		Certificates: []tls.Certificate{pair},
-	})
+func (t *TLSAdaptor) createCertForName(name string) {
 
-	t := &TlsAdaptor{
-		srcRequestURI: r.RequestURI,
-		srcConn:       tlsConn,
-	}
-	dstConn, err := tls.Dial("tcp", r.RequestURI, &tls.Config{})
+}
+
+func (t *TLSAdaptor) decryptTLS() {
+
+	dstConn, err := tls.Dial("tcp", t.srcRequestURI, &tls.Config{})
 	if err != nil {
 		fmt.Errorf("%v\n", err)
-		return nil
+		return
 	}
 	go func() {
 		dstConn.Handshake()
-		transfer(tlsConn, dstConn)
+		transfer(t.srcConn, dstConn)
 	}()
 	c := make(chan *Message, 1)
 	go func() {
 		t.srcConn.Handshake()
 		for {
 			bytes := make([]byte, 1024)
-			n, err := tlsConn.Read(bytes)
+			n, err := t.srcConn.Read(bytes)
 			c <- &Message{
 				bytes: bytes,
 				n:     n,
@@ -106,7 +107,7 @@ func NewAdaptor(conn *net.Conn, w http.ResponseWriter, r *http.Request) *TlsAdap
 
 	go func() {
 		reader := ConnReader{
-			conn:    tlsConn,
+			conn:    t.srcConn,
 			channel: c,
 		}
 		for {
@@ -118,7 +119,34 @@ func NewAdaptor(conn *net.Conn, w http.ResponseWriter, r *http.Request) *TlsAdap
 			fmt.Printf("成功解析到Https请求。Host： %s， Path %s\n", req.Host, req.URL)
 		}
 	}()
-	return t
+}
+
+func NewAdaptor(conn net.Conn, w http.ResponseWriter, r *http.Request) *TLSAdaptor {
+	tlsConn := tls.Server(conn, &tls.Config{
+		Certificates: []tls.Certificate{pair},
+		GetCertificate: func(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			rootkey,_ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+			b, err := x509.CreateCertificate(rand.Reader,pair.Leaf,pair.Leaf, rootkey.Public(),rootkey)
+			if err != nil {
+				panic(err)
+			}
+			cert, err := x509.ParseCertificate(b)
+			tlsCert := &tls.Certificate{
+				Certificate:                 [][]byte{cert.Raw},
+				PrivateKey:                  rootkey,
+				OCSPStaple:                  nil,
+				SignedCertificateTimestamps: nil,
+				Leaf:                        cert,
+			}
+			return tlsCert, nil
+		},
+	})
+	return &TLSAdaptor{
+		srcConn: tlsConn,
+		srcRequestURI:    r.RequestURI,
+		selfSignCertPair: pair,
+		template: pair,
+	}
 }
 
 type Message struct {
